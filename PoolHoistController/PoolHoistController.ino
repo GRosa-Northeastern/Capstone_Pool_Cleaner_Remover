@@ -3,13 +3,28 @@ const uint8_t lower_contactSwitch = 8;
 const uint8_t upper_contactSwitch = 9;
 
 /* --- Motor Pin --- */
-const uint8_t motor_pin = 3; // Should be controlled via PWM on Arduino
+const uint8_t motor_pin = 3;
+
+/* --- Motor Driver Pins (DIR + PWM + EN + optional BRK) --- */
+const uint8_t pinPWM = motor_pin;  
+const uint8_t pinDIR = 10;         
+const uint8_t pinEN  = 11;         
+const uint8_t pinBRK = 12;         // optional brake input (active-HIGH)
+
+/* --- Manual speeds (PWM duty) --- */
+const uint8_t LIFT_DUTY  = 180;   // tune later
+const uint8_t DROP_DUTY  = 160;   // tune later
 
 /* --- Button Pins --- */
 const uint8_t lift_button = 4;
 const uint8_t lower_button = 5;
 const uint8_t mode_switch = 6;
-const uint8_t e_stop = 7;
+
+/* --- Tension Controller Tuning knobs --- */
+const uint8_t  DUTY_PULL         = 170;      // PWM for pull jogs (0–255)
+const uint8_t  DUTY_DROP         = 150;      // PWM for drop jogs (0–255)
+const unsigned long JOG_PULSE_MS = 220;      // how long to jog each correction
+const unsigned long COOLDOWN_MS  = 500;      // quiet time after a jog to avoid noise
 
 /* --- Other Variables --- */
 const unsigned long DEBOUNCE_MS = 35;
@@ -20,7 +35,7 @@ const unsigned long DEBOUNCE_MS = 35;
  * Details:
  * - All buttons/switches are configured with INPUT_PULLUP, so ACTIVE == LOW.
  * - Motor is disabled at boot (analogWrite 0).
- * - Warn if both contact switches read active or if E-STOP is tripped.
+ * - Warn if both contact switches read active
  *
  * @return void
  */
@@ -60,22 +75,6 @@ bool readPressEdge(uint8_t pin);
  *  @return true once when the long-press completes.
  */
 bool readLongPress(uint8_t pin, unsigned long hold_ms);
-
-/** 
- *  @brief True if E-STOP input is tripped 
- */
-bool estopTripped();
-
-/** 
- *  @brief Immediately cut motor output and latch the controller in EStopped. 
- */
-void enterEStopped();
-
-/** 
- *  @brief Attempt reset from E-STOP latch using current chosen gesture.
- *  Requires E-STOP healthy. Returns true if reset succeeded.
- */
-bool tryResetFromEStop();
 
 /** 
  *  @brief Drive motor in the PULL (retract) direction at a duty.
@@ -118,10 +117,15 @@ enum TensionStatus : uint8_t {
 TensionStatus tensionHoldTask();
 
 /** 
- *  @brief One FSM step. Handles Ready↔TensionHold, Fault, and EStopped. 
+ *  @brief One FSM step. Handles Ready↔TensionHold, Fault
  */
 void fsmStep();
 
+/** 
+ *  @brief Manual hold-to-run behavior used by READY (and when exiting TENSION).
+ *  Drives PULL/DROP while exactly one of Lift/Lower is held; otherwise stops.
+ */
+void handleManualRun();
 
 void setup(){
    // Setup Serial Monitor for testing
@@ -131,10 +135,23 @@ void setup(){
    initializeHardware();
 
    /* --- Boot up banner --- */ 
-   Serial.println("[BOOT] Pins initialized.");
-   Serial.print("  E-STOP level: "); Serial.println(digitalRead(e_stop));
-   Serial.print("  Lower SW: ");     Serial.println(digitalRead(lower_contactSwitch));
-   Serial.print("  Upper SW: ");     Serial.println(digitalRead(upper_contactSwitch));
+   Serial.println(F("==== Pool Hoist Controller ===="));
+   Serial.print  (F("Build: ")); Serial.print(F(__DATE__)); Serial.print(F(" "));
+   Serial.println(F(__TIME__));
+   Serial.println(F("Pins: PWM=D3  DIR=D10  EN=D11  BRK=D12"));
+   Serial.println(F("DIR map: HIGH=PULL, LOW=DROP")); 
+   Serial.print  (F("Tune: LIFT=")); Serial.print(LIFT_DUTY);
+   Serial.print  (F(" DROP="));       Serial.print(DROP_DUTY);
+   Serial.print  (F(" JOG="));        Serial.print(JOG_PULSE_MS);
+   Serial.print  (F("ms COOL="));     Serial.print(COOLDOWN_MS);
+   Serial.println(F("ms"));
+
+   Serial.print  (F("Init Levels  LowerSW=")); Serial.print(digitalRead(lower_contactSwitch));
+   Serial.print  (F(" UpperSW="));             Serial.print(digitalRead(upper_contactSwitch));
+   Serial.print  (F(" EN="));                  Serial.print(digitalRead(pinEN));
+   Serial.print  (F(" BRK="));                 Serial.print(digitalRead(pinBRK));
+   Serial.print  (F(" DIR="));                 Serial.println(digitalRead(pinDIR));
+   Serial.println(F("================================"));
 }
 
 void loop() {
@@ -151,12 +168,15 @@ void initializeHardware() {
    pinMode(lower_button, INPUT_PULLUP);
    pinMode(mode_switch,  INPUT_PULLUP);
 
-   /* E-STOP: normally-closed chain → HIGH when OK, LOW when tripped */
-   pinMode(e_stop, INPUT_PULLUP);
-
    /* --- Motor Output --- */
    pinMode(motor_pin, OUTPUT);
-   motorStop();  // motor should not be on when machine is turned on
+   
+   /* --- Motor Driver IO --- */
+   pinMode(pinDIR, OUTPUT);  digitalWrite(pinDIR, LOW);   // LOW should be drop, CHANGE if untrue
+   pinMode(pinEN,  OUTPUT);  digitalWrite(pinEN,  LOW);   // disabled at boot
+   pinMode(pinBRK, OUTPUT);  digitalWrite(pinBRK, LOW);   // brake off
+
+   motorStop();  // PWM = 0, EN = LOW
 
    /* --- Failure Detection to be built later using Onboard LED ---*/
    pinMode(LED_BUILTIN, OUTPUT);
@@ -167,9 +187,6 @@ void initializeHardware() {
    const bool tightActive = readContactSwitch(upper_contactSwitch);
    if (looseActive && tightActive) {
       Serial.println(F("[WARNING] Both contact switches read ACTIVE at boot (wiring or mechanical conflict)."));
-   }
-   if (digitalRead(e_stop) == LOW) {
-      Serial.println(F("[WARNING] E-STOP is TRIPPED at boot. Clear before operation."));
    }
 }
 
@@ -206,16 +223,18 @@ bool readLongPress(uint8_t pin, unsigned long hold_ms) {
 
 /* --- Motor Functions --- */
 void motorStop() {
-   analogWrite(motor_pin, 0);
+   analogWrite(pinPWM, 0);
+   digitalWrite(pinEN, LOW);   
 }
 
 void motorRun(uint8_t duty) {
-   // Clamp and write PWM
-   if (duty > 255) {
+   if (duty > 255){
       duty = 255;
-   }
-   analogWrite(motor_pin, duty);
+   } 
+   digitalWrite(pinEN, HIGH);   
+   analogWrite(pinPWM, duty);   
 }
+
 
 /* --- Contact Switch Readings --- */
 bool readContactSwitch(uint8_t pin) {
@@ -224,11 +243,6 @@ bool readContactSwitch(uint8_t pin) {
 }
 
 /* --- Tensioner Controller ---*/
-/* --- Tuning knobs --- */
-const uint8_t  DUTY_PULL         = 170;      // PWM for pull jogs (0–255)
-const uint8_t  DUTY_DROP         = 150;      // PWM for drop jogs (0–255)
-const unsigned long JOG_PULSE_MS = 220;      // how long to jog each correction
-const unsigned long COOLDOWN_MS  = 500;      // quiet time after a jog to avoid noise
 volatile TensionStatus tensionStatus = TENSION_IDLE;
 
 /* --- Internal jog state --- */
@@ -236,21 +250,32 @@ static bool           jogActive      = false;
 static unsigned long  jogEndAt_ms    = 0;
 static unsigned long  cooldownUntil  = 0;
 
-/* -------------------------------------------------------
- * driveMotorPull / driveMotorDrop
- * For now these just call motorRun() so we can compile and test timing.
- * We can replace the bodies when we add a DIR pin / H-bridge / relay mapping.
- * ------------------------------------------------------- 
+/*
+ * @brief Define PULL and DROP by DIR level. Flip HIGH/LOW meanings if reversed. 
  */
 void driveMotorPull(uint8_t duty) {
-   // TODO: set DIR=REVERSE; then PWM
+   digitalWrite(pinDIR, HIGH);  // define HIGH = PULL (retract)
    motorRun(duty);
 }
 
 void driveMotorDrop(uint8_t duty) {
-   // TODO: set DIR=FORWARD; then PWM
+   digitalWrite(pinDIR, LOW);   // define LOW  = DROP (let out)
    motorRun(duty);
 }
+
+void handleManualRun() {
+   bool liftHeld  = (digitalRead(lift_button)  == LOW);
+   bool lowerHeld = (digitalRead(lower_button) == LOW);
+
+   if (liftHeld && !lowerHeld) {
+      driveMotorPull(LIFT_DUTY);
+   } else if (lowerHeld && !liftHeld) {
+      driveMotorDrop(DROP_DUTY);
+   } else {
+      motorStop();
+   }
+}
+
 
 /* -------------------------------------------------------
  * startJog
@@ -333,53 +358,15 @@ TensionStatus tensionHoldTask() {
    return tensionStatus;
 }
 
-/* --- E-STOP guard --- */
-
-bool estopTripped() { return digitalRead(e_stop) == LOW; }
-
-enum class State : uint8_t { Ready, TensionHold, Fault, EStopped };
+enum class State : uint8_t { Ready, TensionHold, Fault };
 State state = State::Ready;
 
-void enterEStopped() {
-   motorStop();
-   state = State::EStopped;
-   Serial.println(F("[E-STOP] TRIPPED -> power cut, software latched."));
-}
-
-bool tryResetFromEStop() {
-   if (estopTripped()) return false; // cannot reset while pressed
-   // Current reset gesture is holding mode_switch, but can be changed or just removed (I don't like the idea of removing this as I would rather they intentionally need to do something to reset)
-   if (readLongPress(mode_switch, 1500)) {
-      Serial.println(F("[E-STOP] Reset gesture accepted. Rebooting logic..."));
-      // optional: re-run checks
-      state = State::Ready;
-      return true;
-   }
-   return false;
-}
-
 /* --- Minimal FSM (READY ↔ TENSION_HOLD) --- */
-
-const uint8_t LIFT_DUTY  = 180;  // tune later
-const uint8_t DROP_DUTY  = 160;
-
 void fsmStep() {
-   // Global, highest priority: hard E-STOP
-   if (estopTripped() && state != State::EStopped) {
-      enterEStopped();
-      return;
-   }
-
    switch (state) {
-      case State::EStopped:
-         motorStop();
-         Serial.println(F("[STATE] -> Estop Tripped"));
-         tryResetFromEStop();
-         return;
-
       case State::Fault:
          motorStop();
-         if (readLongPress(mode_switch, 1500) && !estopTripped()) {
+         if (readLongPress(mode_switch, 1500)) {
             state = State::Ready;
          }
          return;
@@ -392,39 +379,33 @@ void fsmStep() {
             Serial.println(F("[STATE] -> TENSION_HOLD"));
             break;
          }
+         // Hold to run manual
+         handleManualRun();
 
-         // Hold-to-run manual control
-         bool liftHeld  = (digitalRead(lift_button)  == LOW);
-         bool lowerHeld = (digitalRead(lower_button) == LOW);
-
-         if (liftHeld && !lowerHeld) {
-            // retract while held
-            driveMotorPull(LIFT_DUTY);
-         } else if (lowerHeld && !liftHeld) {
-            // let out while held
-            driveMotorDrop(DROP_DUTY);
-         } else {
-            // neither (or both) -> stop
-            motorStop();
-         }
+         // Manual interlocks: stop if trying to move into an active limit
+         if (digitalRead(lift_button) == LOW && readContactSwitch(upper_contactSwitch)) motorStop();
+         if (digitalRead(lower_button) == LOW && readContactSwitch(lower_contactSwitch)) motorStop();
       } 
       break;
 
       case State::TensionHold: {
-         // Allow manual override while in water:
+         // TensionHold
          bool liftHeld  = (digitalRead(lift_button)  == LOW);
          bool lowerHeld = (digitalRead(lower_button) == LOW);
-         if (liftHeld != lowerHeld) {
-            // exactly one held -> manual overrides tension
-            if (liftHeld)  driveMotorPull(LIFT_DUTY);
-            if (lowerHeld) driveMotorDrop(DROP_DUTY);
-         } else {
-            // no manual override -> run the tension keeper
-            TensionStatus s = tensionHoldTask();
-            if (s == TENSION_CONFLICT) {
-               Serial.println(F("[FAULT] Tension switch conflict."));
-               state = State::Fault;
-            }
+
+         // Manual override -> exit to READY immediately and act this cycle
+         if (liftHeld || lowerHeld) {
+            state = State::Ready;
+            Serial.println(F("[STATE] TensionHold -> READY (manual override)"));
+            handleManualRun();
+            break;
+         }
+
+         // No manual -> run tension keeper
+         TensionStatus s = tensionHoldTask();
+         if (s == TENSION_CONFLICT) {
+            Serial.println(F("[FAULT] Tension switch conflict."));
+            state = State::Fault;
          }
 
          // Toggle back to READY on MODE press
@@ -432,8 +413,8 @@ void fsmStep() {
             motorStop();
             state = State::Ready;
             Serial.println(F("[STATE] -> READY"));
-         }
-      } break;
+         } 
+      }
+      break;
    }
 }
-

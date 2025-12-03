@@ -7,22 +7,22 @@ const uint8_t motor_pin = 3;
 
 /* --- Motor Driver Pins (DIR + PWM + EN + optional BRK) --- */
 const uint8_t pinPWM = motor_pin;  
-const uint8_t pinDIR = 10;         
-const uint8_t pinEN  = 11;         
-const uint8_t pinBRK = 12;         // optional brake input (active-HIGH)
+const uint8_t pinDIR = 4;         
+// const uint8_t pinEN  = 11;         
+const uint8_t pinBRK = 5;         // optional brake input (active-HIGH)
 
 /* --- Manual speeds (PWM duty) --- */
-const uint8_t LIFT_DUTY  = 180;   // tune later
-const uint8_t DROP_DUTY  = 160;   // tune later
+const uint8_t LIFT_DUTY  = 200;   // tune later
+const uint8_t DROP_DUTY  = 200;   // tune later
 
 /* --- Button Pins --- */
-const uint8_t lift_button = 4;
-const uint8_t lower_button = 5;
-const uint8_t mode_switch = 6;
+const uint8_t lift_button = 12;
+const uint8_t lower_button = 13;
+const uint8_t mode_switch = 11;
 
 /* --- Tension Controller Tuning knobs --- */
-const uint8_t  DUTY_PULL         = 170;      // PWM for pull jogs (0–255)
-const uint8_t  DUTY_DROP         = 150;      // PWM for drop jogs (0–255)
+const uint8_t  DUTY_PULL         = 200;      // PWM for pull jogs (0–255)
+const uint8_t  DUTY_DROP         = 200;      // PWM for drop jogs (0–255)
 const unsigned long JOG_PULSE_MS = 220;      // how long to jog each correction
 const unsigned long COOLDOWN_MS  = 500;      // quiet time after a jog to avoid noise
 
@@ -148,7 +148,6 @@ void setup(){
 
    Serial.print  (F("Init Levels  LowerSW=")); Serial.print(digitalRead(lower_contactSwitch));
    Serial.print  (F(" UpperSW="));             Serial.print(digitalRead(upper_contactSwitch));
-   Serial.print  (F(" EN="));                  Serial.print(digitalRead(pinEN));
    Serial.print  (F(" BRK="));                 Serial.print(digitalRead(pinBRK));
    Serial.print  (F(" DIR="));                 Serial.println(digitalRead(pinDIR));
    Serial.println(F("================================"));
@@ -173,7 +172,6 @@ void initializeHardware() {
    
    /* --- Motor Driver IO --- */
    pinMode(pinDIR, OUTPUT);  digitalWrite(pinDIR, LOW);   // LOW should be drop, CHANGE if untrue
-   pinMode(pinEN,  OUTPUT);  digitalWrite(pinEN,  LOW);   // disabled at boot
    pinMode(pinBRK, OUTPUT);  digitalWrite(pinBRK, LOW);   // brake off
 
    motorStop();  // PWM = 0, EN = LOW
@@ -224,14 +222,12 @@ bool readLongPress(uint8_t pin, unsigned long hold_ms) {
 /* --- Motor Functions --- */
 void motorStop() {
    analogWrite(pinPWM, 0);
-   digitalWrite(pinEN, LOW);   
 }
 
 void motorRun(uint8_t duty) {
    if (duty > 255){
       duty = 255;
    } 
-   digitalWrite(pinEN, HIGH);   
    analogWrite(pinPWM, duty);   
 }
 
